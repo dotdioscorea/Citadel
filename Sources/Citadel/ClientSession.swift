@@ -73,9 +73,12 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
         promise.futureResult
     }
 
-    init(eventLoop: EventLoop, loginTimeout: TimeAmount) {
+    init(eventLoop: EventLoop, loginTimeout: TimeAmount, closeFuture: EventLoopFuture<Void>) {
         let promise = eventLoop.makePromise(of: Void.self)
         self.promise = promise
+        // NIOSSH consumes channelInactive rather than forwarding it. Observe
+        // the socket's close future directly to unblock a cancelled handshake.
+        closeFuture.whenComplete { _ in promise.fail(ChannelError.ioOnClosedChannel) }
 
         eventLoop.scheduleTask(deadline: .now() + loginTimeout) {
             promise.fail(ChannelError.connectTimeout(loginTimeout))
@@ -86,13 +89,6 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
         if event is UserAuthSuccessEvent {
             self.promise.succeed(())
         }
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        // Closing a cancelled or peer-disconnected handshake must release the
-        // async caller immediately, rather than waiting for the login timer.
-        self.promise.fail(ChannelError.ioOnClosedChannel)
-        context.fireChannelInactive()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
@@ -176,7 +172,8 @@ final class SSHClientSession: Sendable {
     ) -> EventLoopFuture<Void> {
         let handshakeHandler = ClientHandshakeHandler(
             eventLoop: channel.eventLoop,
-            loginTimeout: .seconds(10)
+            loginTimeout: .seconds(10),
+            closeFuture: channel.closeFuture
         )
         var clientConfiguration = SSHClientConfiguration(
             userAuthDelegate: settings.authenticationMethod(),
