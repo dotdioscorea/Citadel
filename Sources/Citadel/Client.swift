@@ -173,12 +173,19 @@ public final class SSHClient {
         settings: SSHClientSettings
     ) async throws -> SSHClient {
         let inboundChannelHandler = SSHClientInboundChannelHandler()
-        try await SSHClientSession.addHandlers(
-            on: channel,
-            inboundChannelHandler: inboundChannelHandler,
-            settings: settings
-        ).get()
-        
+        // This async API may be called from any Swift executor. Pipeline
+        // syncOperations must run on the channel's event loop.
+        try await channel.eventLoop.flatSubmit {
+            SSHClientSession.addHandlers(
+                on: channel,
+                inboundChannelHandler: inboundChannelHandler,
+                settings: settings
+            )
+        }.get()
+        // Callers can pause reads before connecting the socket so the server's
+        // identification cannot arrive before the SSH handlers are installed.
+        try await channel.setOption(ChannelOptions.autoRead, value: true).get()
+
         let sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
         let handshakeHandler = try await channel.pipeline.handler(type: ClientHandshakeHandler.self).get()
         let session = try await handshakeHandler.authenticated.map {
