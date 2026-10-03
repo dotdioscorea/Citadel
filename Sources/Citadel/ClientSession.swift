@@ -88,6 +88,13 @@ final class ClientHandshakeHandler: ChannelInboundHandler, Sendable {
         }
     }
 
+    func channelInactive(context: ChannelHandlerContext) {
+        // Closing a cancelled or peer-disconnected handshake must release the
+        // async caller immediately, rather than waiting for the login timer.
+        self.promise.fail(ChannelError.ioOnClosedChannel)
+        context.fireChannelInactive()
+    }
+
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
         self.promise.fail(error)
     }
