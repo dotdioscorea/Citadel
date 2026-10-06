@@ -27,7 +27,7 @@ public final class SFTPClient: Sendable {
     /// What it says on the tin.
     public let logger: Logger
     
-    fileprivate init(channel: Channel, responses: SFTPResponses, logger: Logger) {
+    internal init(channel: Channel, responses: SFTPResponses, logger: Logger) {
         self.channel = channel
         self.responses = responses
         self.logger = logger
@@ -137,7 +137,8 @@ public final class SFTPClient: Sendable {
     ///
     /// - Parameter path: The path to list
     /// - Returns: Array of directory entries
-    /// - Throws: SFTPError if the request fails
+    /// - Throws: A protocol/status error, cancellation, or `SFTPDirectoryCleanupError`
+    ///   if both reading the directory and releasing its handle fail.
     ///
     /// ## Example
     /// ```swift
@@ -155,6 +156,7 @@ public final class SFTPClient: Sendable {
         var oldPath: String
 
         repeat {
+            try Task.checkCancellation()
             oldPath = path
             guard case .name(let realpath) = try await sendRequest(.realpath(.init(requestId: self.allocateRequestId(), path: path))) else {
                 self.logger.warning("SFTP server returned bad response to open file request, this is a protocol error")
@@ -163,6 +165,8 @@ public final class SFTPClient: Sendable {
 
             path = realpath.path
         } while path != oldPath
+
+        try Task.checkCancellation()
         
         guard case .handle(let handle) = try await sendRequest(.opendir(.init(requestId: self.allocateRequestId(), handle: path))) else {
             self.logger.warning("SFTP server returned bad response to open file request, this is a protocol error")
@@ -170,28 +174,57 @@ public final class SFTPClient: Sendable {
         }
         
         var names = [SFTPMessage.Name]()
-        var response = try await sendRequest(
-            .readdir(
-                .init(
+        do {
+            while true {
+                try Task.checkCancellation()
+                let response = try await sendRequest(.readdir(.init(
                     requestId: self.allocateRequestId(),
                     handle: handle.handle
-                )
-            )
-        )
-        
-        while case .name(let name) = response {
-            names.append(name)
-            response = try await sendRequest(
-                .readdir(
-                    .init(
-                        requestId: self.allocateRequestId(),
-                        handle: handle.handle
-                    )
-                )
-            )
+                )))
+                try Task.checkCancellation()
+
+                if case .name(let name) = response {
+                    names.append(name)
+                } else if case .status(let status) = response, status.errorCode == .eof {
+                    break
+                } else {
+                    throw SFTPError.invalidResponse
+                }
+            }
+        } catch {
+            do {
+                try await closeDirectoryHandle(handle.handle)
+            } catch let cleanupError {
+                throw SFTPDirectoryCleanupError(operationError: error, cleanupError: cleanupError)
+            }
+            throw error
         }
-        
+
+        try await closeDirectoryHandle(handle.handle)
+        try Task.checkCancellation()
         return names
+    }
+
+    /// `sendRequest` awaits its reply even under cancellation, allowing acquired handles to be released.
+    private func closeDirectoryHandle(_ handle: ByteBuffer) async throws {
+        // Closing the channel already releases its server-side handles.
+        guard self.isActive else { return }
+        do {
+            let response = try await sendRequest(.closeFile(.init(
+                requestId: self.allocateRequestId(), handle: handle
+            )))
+            guard case .status(let status) = response else {
+                throw SFTPError.invalidResponse
+            }
+            guard status.errorCode == .ok else {
+                throw SFTPError.errorStatus(status)
+            }
+        } catch {
+            // The channel may have closed between the active check and the request.
+            // Its handles are then released without a CLOSE response.
+            guard self.isActive else { return }
+            throw error
+        }
     }
     
     /// Get the attributes of a file on the SFTP server.

@@ -26,6 +26,18 @@ public enum SFTPError: Error {
     case unsupportedVersion(SFTPProtocolVersion)
 }
 
+/// A directory operation failed and its remote handle could not be closed.
+/// Both errors are retained so cleanup never hides the original failure.
+public struct SFTPDirectoryCleanupError: Error {
+    public let operationError: Error
+    public let cleanupError: Error
+
+    internal init(operationError: Error, cleanupError: Error) {
+        self.operationError = operationError
+        self.cleanupError = cleanupError
+    }
+}
+
 public enum CitadelError: Error {
     case invalidKeySize
     case invalidEncryptedPacketLength
