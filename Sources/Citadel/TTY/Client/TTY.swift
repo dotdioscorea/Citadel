@@ -263,7 +263,7 @@ extension SSHClient {
     }
 
     enum CommandMode {
-        case pty(SSHChannelRequestEvent.PseudoTerminalRequest), tty(command: String?), command(String)
+        case pty(SSHChannelRequestEvent.PseudoTerminalRequest, command: String?), tty(command: String?), command(String)
     }
 
     internal func _executeCommandStream(
@@ -323,9 +323,18 @@ extension SSHClient {
         }
 
         switch mode {
-        case .pty(let request):
+        case .pty(let request, let command):
             try await channel.triggerUserOutboundEvent(request)
-            fallthrough
+            if let command {
+                try await channel.triggerUserOutboundEvent(SSHChannelRequestEvent.ExecRequest(
+                    command: command,
+                    wantReply: true
+                ))
+            } else {
+                try await channel.triggerUserOutboundEvent(SSHChannelRequestEvent.ShellRequest(
+                    wantReply: true
+                ))
+            }
         case .tty:
             try await channel.triggerUserOutboundEvent(SSHChannelRequestEvent.ShellRequest(
                 wantReply: true
@@ -344,21 +353,27 @@ extension SSHClient {
     /// - Parameters:
     ///   - request: PTY configuration parameters
     ///   - environment: Array of environment variables to set for the PTY session. This requires `PermitUserEnvironment` to be enabled in your OpenSSH server's configuration.
+    ///   - command: Optional remote command sent as an SSH exec request after PTY allocation. If nil, requests the existing interactive shell. The command is never written to standard input.
     ///   - perform: Closure that receives TTY input/output streams and performs terminal operations
     /// - Throws: Any errors that occur during PTY setup or operation
     @available(macOS 15.0, *)
     public func withPTY(
         _ request: SSHChannelRequestEvent.PseudoTerminalRequest,
         environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
+        command: String? = nil,
         perform: (_ inbound: TTYOutput, _ outbound: TTYStdinWriter) async throws -> Void
     ) async throws {
         let (channel, output) = try await _executeCommandStream(
             environment: environment,
-            mode: .pty(request)
+            mode: .pty(request, command: command)
         )
 
         func close() async throws {
-            try await channel.close()
+            do {
+                try await channel.close()
+            } catch let error as ChannelError where error == .alreadyClosed {
+                // Remote EOF or refusal may close this channel before local cleanup.
+            }
         }
 
         do {
